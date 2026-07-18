@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "tmc5160.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,7 +44,7 @@
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
-
+UART_HandleTypeDef huart2;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -51,12 +52,108 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void DEBUG_UART_Init(void);
+static void log_tmc_state(const char *tag);
+static bool wait_for_position(uint32_t timeout_ms);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Debug UART on USART2 PA2 (TX) / PA3 (RX), 115200 8N1.
+ * Kept out of the .ioc on purpose: CubeMX doesn't know about it, so it lives
+ * entirely in USER CODE sections and survives regeneration. */
+static void DEBUG_UART_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
+  __HAL_RCC_USART2_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Unbuffered stdout: newlib would otherwise malloc a 1 KiB stdio buffer,
+   * which doesn't fit the 0x200 heap. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+/* printf() lands here via _write() in syscalls.c */
+int __io_putchar(int ch)
+{
+  uint8_t c = (uint8_t)ch;
+  HAL_UART_Transmit(&huart2, &c, 1, HAL_MAX_DELAY);
+  return ch;
+}
+
+static void log_tmc_state(const char *tag)
+{
+  uint32_t gstat = tmc5160_read(TMC5160_REG_GSTAT);
+  uint32_t ramp  = tmc5160_read(TMC5160_REG_RAMP_STAT);
+  int32_t  xact  = (int32_t)tmc5160_read(TMC5160_REG_XACTUAL);
+  /* VACTUAL is a 24-bit signed field */
+  int32_t  vact  = ((int32_t)(tmc5160_read(TMC5160_REG_VACTUAL) << 8)) >> 8;
+  uint32_t drv   = tmc5160_read(TMC5160_REG_DRV_STATUS);
+
+  printf("[%s] GSTAT=0x%lX RAMP_STAT=0x%03lX XACTUAL=%ld VACTUAL=%ld DRV_STATUS=0x%08lX\r\n",
+         tag, gstat, ramp, (long)xact, (long)vact, drv);
+
+  if (gstat & 0x1u)   printf("  ! GSTAT.reset: chip reset since last check (power/brown-out?)\r\n");
+  if (gstat & 0x2u)   printf("  ! GSTAT.drv_err: driver shut down, see DRV_STATUS\r\n");
+  if (gstat & 0x4u)   printf("  ! GSTAT.uv_cp: charge pump undervoltage - check VS supply\r\n");
+  if (drv & (1u << 25)) printf("  ! DRV_STATUS.ot: overtemperature shutdown\r\n");
+  else if (drv & (1u << 26)) printf("  ! DRV_STATUS.otpw: overtemperature warning\r\n");
+  if (drv & (1u << 27)) printf("  ! DRV_STATUS.s2ga: short to GND, phase A\r\n");
+  if (drv & (1u << 28)) printf("  ! DRV_STATUS.s2gb: short to GND, phase B\r\n");
+  if (drv & (1u << 12)) printf("  ! DRV_STATUS.s2vsa: short to supply, phase A\r\n");
+  if (drv & (1u << 13)) printf("  ! DRV_STATUS.s2vsb: short to supply, phase B\r\n");
+  /* open-load flags are only meaningful while the motor is moving slowly */
+  if (drv & (1u << 29)) printf("  ! DRV_STATUS.ola: open load, phase A (motor wire?)\r\n");
+  if (drv & (1u << 30)) printf("  ! DRV_STATUS.olb: open load, phase B (motor wire?)\r\n");
+}
+
+static bool wait_for_position(uint32_t timeout_ms)
+{
+  uint32_t start = HAL_GetTick();
+  uint32_t last_log = start;
+
+  while (!tmc5160_position_reached())
+  {
+    uint32_t now = HAL_GetTick();
+    if ((now - start) >= timeout_ms)
+    {
+      printf("TIMEOUT: position not reached after %lu ms\r\n", (unsigned long)timeout_ms);
+      log_tmc_state("timeout");
+      return false;
+    }
+    if ((now - last_log) >= 500u)
+    {
+      log_tmc_state("moving");
+      last_log = now;
+    }
+    HAL_Delay(10);
+  }
+  return true;
+}
 /* USER CODE END 0 */
 
 /**
@@ -90,16 +187,40 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+  DEBUG_UART_Init();
+  printf("\r\n=== stepper-ctl-newboard boot ===\r\n");
+
   /* Give the TMC5160 time to come out of power-on reset */
   HAL_Delay(10);
+
+  uint32_t ioin = tmc5160_read(TMC5160_REG_IOIN);
+  printf("IOIN=0x%08lX version=0x%02lX (expect 0x30)\r\n",
+         ioin, (ioin >> 24) & 0xFFu);
 
   if (!tmc5160_init())
   {
     /* No answer on SPI: check driver supply (VS), wiring and CSN */
+    printf("TMC5160 init FAILED: no/bad answer on SPI\r\n");
+    if (ioin == 0x00000000u)
+    {
+      printf("  MISO stuck low: check VS supply, SDO wiring, CSN\r\n");
+    }
+    else if (ioin == 0xFFFFFFFFu)
+    {
+      printf("  MISO stuck high: check SDO wiring, CSN\r\n");
+    }
     Error_Handler();
   }
+  printf("TMC5160 init OK\r\n");
+
+  /* Read back a config register to prove the MOSI/write path works too
+   * (IOIN only proves we can read) */
+  printf("CHOPCONF readback=0x%08lX (wrote 0x000100C3)\r\n",
+         tmc5160_read(TMC5160_REG_CHOPCONF));
+  log_tmc_state("after init");
 
   tmc5160_set_driver_enabled(true);
+  printf("driver enabled (DRV_ENN low)\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -112,17 +233,20 @@ int main(void)
     /* Demo: sweep 5 revolutions forward, pause, then back to the start.
      * The TMC5160's ramp generator does all the motion; we just set
      * targets and poll until each move completes. */
+    printf("\r\nmove to XTARGET=%ld (+5 rev)\r\n",
+           (long)(5 * TMC5160_USTEPS_PER_REV));
     tmc5160_move_to(5 * TMC5160_USTEPS_PER_REV);
-    while (!tmc5160_position_reached())
+    if (wait_for_position(15000u))
     {
-      HAL_Delay(10);
+      printf("position reached\r\n");
     }
     HAL_Delay(500);
 
+    printf("move to XTARGET=0\r\n");
     tmc5160_move_to(0);
-    while (!tmc5160_position_reached())
+    if (wait_for_position(15000u))
     {
-      HAL_Delay(10);
+      printf("position reached\r\n");
     }
     HAL_Delay(500);
   }
@@ -263,6 +387,8 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  /* HAL_UART_Transmit is a harmless no-op if the UART isn't up yet */
+  printf("FATAL: Error_Handler - halting\r\n");
   __disable_irq();
   while (1)
   {
