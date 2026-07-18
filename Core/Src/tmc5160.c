@@ -88,11 +88,11 @@ bool tmc5160_init(void)
    * gentle default for bring-up -- ADJUST for your R_sense and motor:
    *   I_rms = GLOBALSCALER/256 * (IRUN+1)/32 * V_fs/R_sense * 1/sqrt(2)
    * with V_fs = 0.325 V. */
-  tmc5160_write(TMC5160_REG_GLOBALSCALER, 128u);
+  tmc5160_write(TMC5160_REG_GLOBALSCALER, 255u);
 
   /* IHOLD_IRUN: IRUN=16/31 run current, IHOLD=8/31 standstill current,
    * IHOLDDELAY=6 (smooth ramp-down to hold current). */
-  tmc5160_write(TMC5160_REG_IHOLD_IRUN, (6u << 16) | (16u << 8) | 8u);
+  tmc5160_write(TMC5160_REG_IHOLD_IRUN, (6u << 16) | (31u << 8) | 8u);
 
   /* TPOWERDOWN=10: ~0.2 s from standstill to hold-current reduction */
   tmc5160_write(TMC5160_REG_TPOWERDOWN, 10u);
